@@ -11,8 +11,10 @@ services:
     # O gunicorn tenta criar um socket de controle no HOME; o do usuário `music` não existe e o disco é só leitura.
     environment:
       HOME: /tmp
+    # Volume do Docker (e não pasta do host): ele herda o dono `music` da imagem, então dá pra gravar.
+    # Uma pasta ./data seria criada pelo Docker como root e o container não conseguiria escrever nela.
     volumes:
-      - ./data:/data
+      - music-data:/data
     read_only: true
     tmpfs:
       - /tmp
@@ -20,3 +22,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  music-data:

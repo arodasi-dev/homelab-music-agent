@@ -31,7 +31,8 @@ URL pro app: `https://<nome-do-notebook>.<tailnet>.ts.net:8444`
 ## Manutenção
 - **O YouTube muda e o `yt-dlp` quebra de tempos em tempos.** Se os downloads começarem a falhar,
   suba a versão em `requirements.txt` e rode `docker compose up -d --build`.
-- Os arquivos ficam em `./data/<id-do-video>/` (volume do Docker). Pra limpar tudo, apague essa pasta.
+- Os arquivos ficam no volume do Docker `music-data` (`/data/<id-do-video>/` dentro do container).
+  Pra ver o tamanho: `docker system df -v`. Pra limpar tudo: `docker compose down -v` (apaga a biblioteca inteira).
 
 ## Teste rápido
 ```
