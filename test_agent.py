@@ -100,6 +100,58 @@ def test_audio_aceita_token_na_query_e_suporta_range(client):
     assert res.data == b"2345"
 
 
+class FakeUpstream:
+    """Resposta do YouTube: 206 com o trecho pedido."""
+
+    status = 206
+    headers = {"Content-Type": "audio/mp4", "Content-Range": "bytes 2-5/10", "Content-Length": "4", "Set-Cookie": "x"}
+
+    def __init__(self):
+        self.parts = [b"23", b"45"]
+        self.closed = False
+
+    def read(self, size):
+        return self.parts.pop(0) if self.parts else b""
+
+    def close(self):
+        self.closed = True
+
+
+def test_ouvir_baixando_repassa_o_range_do_youtube(client):
+    info = {**INFO, "url": "https://rr1.googlevideo.example/audio", "http_headers": {"User-Agent": "yt"}}
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["url"], seen["headers"] = request.full_url, dict(request.header_items())
+        return FakeUpstream()
+
+    with patch.object(agent, "fetch_info", return_value=info), \
+         patch.object(agent, "download_audio", side_effect=RuntimeError("ainda baixando")), \
+         patch.object(agent, "urlopen", fake_urlopen):
+        add(client)
+        res = client.get(f"/tracks/{VIDEO}/audio?t=segredo&live=1", headers={"Range": "bytes=2-5"})
+    assert res.status_code == 206
+    assert res.data == b"2345"
+    assert res.headers["Content-Range"] == "bytes 2-5/10"
+    assert "Set-Cookie" not in res.headers
+    assert seen["url"] == "https://rr1.googlevideo.example/audio"
+    assert seen["headers"]["Range"] == "bytes=2-5" and seen["headers"]["User-agent"] == "yt"
+
+
+def test_ouvir_baixando_sem_endereco_conhecido_da_404(client):
+    with patch.object(agent, "fetch_info", return_value=INFO), patch.object(agent, "download_audio", fake_download):
+        add(client)
+    assert client.get(f"/tracks/{VIDEO}/audio?t=segredo&live=1").status_code == 404
+
+
+def test_ouvir_baixando_com_youtube_fora_do_ar_da_502(client):
+    info = {**INFO, "url": "https://rr1.googlevideo.example/audio"}
+    with patch.object(agent, "fetch_info", return_value=info), patch.object(agent, "download_audio", fake_download), \
+         patch.object(agent, "urlopen", side_effect=OSError("sem rede")):
+        add(client)
+        assert client.get(f"/tracks/{VIDEO}/audio?t=segredo&live=1").status_code == 502
+
+
 def test_capa(client):
     with patch.object(agent, "fetch_info", return_value=INFO), patch.object(agent, "download_audio", fake_download):
         add(client)

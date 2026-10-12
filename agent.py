@@ -6,10 +6,12 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
-from flask import Flask, abort, jsonify, request, send_file
+from flask import Flask, Response, abort, jsonify, request, send_file
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 VIDEO_ID = re.compile(r"^[\w-]{11}$")
@@ -17,6 +19,10 @@ MAX_DURATION_S = 3 * 3600
 SEARCH_LIMIT = 10
 MAX_QUERY_LENGTH = 100
 MAX_PARALLEL_DOWNLOADS = 2
+AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
+STREAM_TIMEOUT_S = 15
+STREAM_CHUNK = 64 * 1024
+PASSTHROUGH_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 AUDIO_FILE = "audio.m4a"
 THUMB_FILE = "audio.jpg"
 META_FILE = "meta.json"
@@ -32,8 +38,29 @@ def ydl_options(**extra):
 
 
 def fetch_info(url):
-    with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+    # Com o formato de áudio escolhido, o `info` já traz o endereço direto do áudio (`url`), usado no "ouvir baixando".
+    with yt_dlp.YoutubeDL(ydl_options(format=AUDIO_FORMAT)) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def open_stream(stream, range_header):
+    """Abre o áudio direto no YouTube (repassando o `Range` do player) pra tocar antes do download terminar."""
+    headers = dict(stream["headers"])
+    if range_header:
+        headers["Range"] = range_header
+    return urlopen(Request(stream["url"], headers=headers), timeout=STREAM_TIMEOUT_S)
+
+
+def stream_response(upstream):
+    def chunks():
+        try:
+            while data := upstream.read(STREAM_CHUNK):
+                yield data
+        finally:
+            upstream.close()
+
+    headers = {k: upstream.headers[k] for k in PASSTHROUGH_HEADERS if upstream.headers.get(k)}
+    return Response(chunks(), status=upstream.status, headers=headers)
 
 
 def search_videos(query):
@@ -55,7 +82,7 @@ def search_videos(query):
 
 def download_audio(url, dest):
     options = ydl_options(
-        format="bestaudio[ext=m4a]/bestaudio/best",
+        format=AUDIO_FORMAT,
         outtmpl=str(dest / "audio.%(ext)s"),
         writethumbnail=True,
         postprocessors=[
@@ -121,6 +148,7 @@ def create_app(token, allowed_origin, data_dir, executor=None):
     app = Flask(__name__)
     library = Library(data_dir)
     executor = executor or ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS)
+    streams = {}  # id -> endereço direto do áudio; só vale pra faixas adicionadas desde que o servidor subiu
 
     @app.after_request
     def cors(response):
@@ -194,6 +222,8 @@ def create_app(token, allowed_origin, data_dir, executor=None):
             "added": time.time(),
         }
         library.write(track_id, meta)
+        if info.get("url"):
+            streams[track_id] = {"url": info["url"], "headers": info.get("http_headers") or {}}
         executor.submit(run_download, library, track_id, f"https://www.youtube.com/watch?v={track_id}")
         return jsonify(meta), 202
 
@@ -205,6 +235,17 @@ def create_app(token, allowed_origin, data_dir, executor=None):
 
     @app.get("/tracks/<track_id>/audio")
     def audio(track_id):
+        if request.args.get("live"):  # tocando enquanto baixa: o arquivo ainda não está pronto
+            track_or_404(track_id)
+            stream = streams.get(track_id)
+            if not stream:
+                abort(404)
+            try:
+                return stream_response(open_stream(stream, request.headers.get("Range")))
+            except HTTPError as exc:
+                abort(exc.code if exc.code == 416 else 502)
+            except OSError:
+                abort(502)
         return file_or_404(track_id, AUDIO_FILE, "audio/mp4")
 
     @app.get("/tracks/<track_id>/thumb")
