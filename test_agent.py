@@ -217,6 +217,98 @@ def test_busca_que_falha_devolve_502(client):
         assert client.get("/search?q=x", headers=auth()).status_code == 502
 
 
+@pytest.fixture
+def two_users(tmp_path):
+    """O app com a Isadora (administra, token "segredo") e a Maria (conta criada depois, com limite de 2)."""
+    app = agent.create_app("segredo", ORIGIN, tmp_path, executor=SyncExecutor(), admin_name="isadora")
+    maria_token = agent.Accounts(tmp_path / "users.json").create("maria", limit=2)
+    return app.test_client(), maria_token
+
+
+def as_maria(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def add_video(client, headers, video=VIDEO):
+    info = {**INFO, "id": video}
+    with patch.object(agent, "fetch_info", return_value=info), patch.object(agent, "download_audio", fake_download):
+        return client.post("/tracks", json={"url": f"https://youtu.be/{video}"}, headers=headers)
+
+
+def test_cada_pessoa_ve_so_a_propria_biblioteca(two_users):
+    client, maria = two_users
+    add_video(client, auth())
+    assert client.get("/tracks", headers=as_maria(maria)).get_json() == []
+    assert len(client.get("/tracks", headers=auth()).get_json()) == 1
+
+
+def test_nao_acessa_faixa_de_outra_pessoa(two_users):
+    client, maria = two_users
+    add_video(client, auth())
+    for path in (f"/tracks/{VIDEO}/audio", f"/tracks/{VIDEO}/thumb", f"/tracks/{VIDEO}/audio?live=1"):
+        assert client.get(path, headers=as_maria(maria)).status_code == 404
+    assert client.delete(f"/tracks/{VIDEO}", headers=as_maria(maria)).status_code == 404
+    assert client.get(f"/tracks/{VIDEO}/audio", headers=auth()).status_code == 200
+
+
+def test_mesmo_video_e_baixado_uma_vez_so(two_users):
+    client, maria = two_users
+    add_video(client, auth())
+    with patch.object(agent, "fetch_info", return_value=INFO), patch.object(agent, "download_audio") as again:
+        res = client.post("/tracks", json={"url": URL}, headers=as_maria(maria))
+    again.assert_not_called()
+    assert res.status_code == 200 and res.get_json()["status"] == "ready"
+    assert client.get(f"/tracks/{VIDEO}/audio", headers=as_maria(maria)).status_code == 200
+
+
+def test_arquivo_so_some_quando_o_ultimo_dono_apaga(two_users, tmp_path):
+    client, maria = two_users
+    add_video(client, auth())
+    client.post("/tracks", json={"url": URL}, headers=as_maria(maria))
+    client.delete(f"/tracks/{VIDEO}", headers=auth())
+    assert (tmp_path / "tracks" / VIDEO / agent.AUDIO_FILE).exists()
+    assert client.get(f"/tracks/{VIDEO}/audio", headers=as_maria(maria)).status_code == 200
+    client.delete(f"/tracks/{VIDEO}", headers=as_maria(maria))
+    assert not (tmp_path / "tracks" / VIDEO).exists()
+
+
+def test_limite_de_musicas_da_conta(two_users):
+    client, maria = two_users
+    assert add_video(client, as_maria(maria), "aaaaaaaaaaa").status_code == 202
+    assert add_video(client, as_maria(maria), "bbbbbbbbbbb").status_code == 202
+    res = add_video(client, as_maria(maria), "ccccccccccc")
+    assert res.status_code == 403 and "Limite" in res.get_json()["error"]
+    assert len(client.get("/tracks", headers=as_maria(maria)).get_json()) == 2
+    assert add_video(client, auth(), "ccccccccccc").status_code == 202  # o limite é por pessoa
+
+
+def test_me_mostra_conta_e_uso(two_users):
+    client, maria = two_users
+    add_video(client, as_maria(maria))
+    assert client.get("/me", headers=as_maria(maria)).get_json() == {"name": "maria", "count": 1, "limit": 2}
+    assert client.get("/me", headers=auth()).get_json()["name"] == "isadora"
+
+
+def test_token_de_conta_apagada_para_de_valer(two_users, tmp_path):
+    client, maria = two_users
+    assert client.get("/tracks", headers=as_maria(maria)).status_code == 200
+    agent.Accounts(tmp_path / "users.json").remove("maria")  # como o `manage.py remove-user`, com o servidor no ar
+    assert client.get("/tracks", headers=as_maria(maria)).status_code == 401
+
+
+def test_pastas_antigas_viram_da_conta_de_quem_administra(tmp_path):
+    old = tmp_path / VIDEO
+    old.mkdir()
+    (old / agent.META_FILE).write_text(
+        '{"id": "%s", "title": "Antiga", "channel": "C", "duration": 9, "status": "ready", "error": null, "added": 7}' % VIDEO,
+        encoding="utf-8",
+    )
+    app = agent.create_app("segredo", ORIGIN, tmp_path, executor=SyncExecutor(), admin_name="isadora")
+    assert (tmp_path / "tracks" / VIDEO / agent.META_FILE).exists() and not old.exists()
+    [track] = app.test_client().get("/tracks", headers=auth()).get_json()
+    assert track["title"] == "Antiga" and track["added"] == 7
+
+
 def test_cors_so_pra_origem_permitida(client):
     ok = client.options("/tracks", headers={"Origin": ORIGIN})
     assert ok.status_code == 200

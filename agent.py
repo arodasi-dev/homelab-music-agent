@@ -1,8 +1,8 @@
 """Agente de música do homelab: baixa o áudio de vídeos do YouTube e serve pro app yt-music-app."""
-import hmac
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,7 +11,9 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import yt_dlp
-from flask import Flask, Response, abort, jsonify, request, send_file
+from flask import Flask, Response, abort, g, jsonify, request, send_file
+
+from accounts import Accounts, LimitReached
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 VIDEO_ID = re.compile(r"^[\w-]{11}$")
@@ -95,12 +97,23 @@ def download_audio(url, dest):
 
 
 class Library:
-    """Uma pasta por vídeo em `root/<video_id>/` com o áudio, a capa e um meta.json."""
+    """Os arquivos de todo mundo: uma pasta por vídeo em `data/tracks/<video_id>/` com áudio, capa e meta.json.
 
-    def __init__(self, root):
-        self.root = Path(root)
+    Quem tem cada faixa fica em `Accounts`; um vídeo só é baixado e guardado uma vez, mesmo com vários donos.
+    """
+
+    def __init__(self, data_dir):
+        data_dir = Path(data_dir)
+        self.root = data_dir / "tracks"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._adopt_legacy_folders(data_dir)
         self._fail_interrupted()
+
+    def _adopt_legacy_folders(self, data_dir):
+        # Antes das contas, as pastas ficavam direto em `data/`.
+        for old in data_dir.iterdir():
+            if old.is_dir() and VIDEO_ID.match(old.name) and (old / META_FILE).exists():
+                old.rename(self.root / old.name)
 
     def folder(self, track_id):
         return self.root / track_id
@@ -124,6 +137,8 @@ class Library:
 
     def delete(self, track_id):
         folder = self.folder(track_id)
+        if not folder.is_dir():
+            return
         for item in folder.iterdir():
             item.unlink()
         folder.rmdir()
@@ -144,10 +159,14 @@ def run_download(library, track_id, url):
         library.write(track_id, {**meta, "status": "error", "error": str(exc)[:200]})
 
 
-def create_app(token, allowed_origin, data_dir, executor=None):
+def create_app(token, allowed_origin, data_dir, executor=None, admin_name="admin"):
+    """`token` e `admin_name` só criam a primeira conta (de quem administra); as outras vêm do `manage.py`."""
     app = Flask(__name__)
     library = Library(data_dir)
+    accounts = Accounts(Path(data_dir) / "users.json")
+    accounts.bootstrap(admin_name, token, {m["id"]: m["added"] for m in library.list()})
     executor = executor or ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS)
+    add_lock = threading.Lock()  # duas pessoas adicionando o mesmo vídeo ao mesmo tempo não baixam duas vezes
     streams = {}  # id -> endereço direto do áudio; só vale pra faixas adicionadas desde que o servidor subiu
 
     @app.after_request
@@ -165,11 +184,15 @@ def create_app(token, allowed_origin, data_dir, executor=None):
             return
         # <audio> e <img> não mandam header, então o app também aceita o token em `?t=`.
         sent = request.headers.get("Authorization", "").removeprefix("Bearer ") or request.args.get("t", "")
-        if not hmac.compare_digest(sent, token):
+        g.user = accounts.authenticate(sent)
+        if not g.user:
             abort(401)
 
     def track_or_404(track_id):
-        meta = VIDEO_ID.match(track_id) and library.read(track_id)
+        """A faixa só existe pra quem a tem na própria lista."""
+        if not VIDEO_ID.match(track_id) or not accounts.has_track(g.user, track_id):
+            abort(404)
+        meta = library.read(track_id)
         if not meta:
             abort(404)
         return meta
@@ -181,9 +204,18 @@ def create_app(token, allowed_origin, data_dir, executor=None):
             abort(404)
         return send_file(path, mimetype=mimetype, conditional=True, max_age=86400)
 
+    def with_added(meta):
+        return {**meta, "added": accounts.tracks(g.user)[meta["id"]]}  # "quando" é por pessoa
+
+    @app.get("/me")
+    def me():
+        return jsonify(accounts.info(g.user))
+
     @app.get("/tracks")
     def list_tracks():
-        return jsonify(library.list())
+        mine = accounts.tracks(g.user)
+        metas = (library.read(track_id) for track_id in mine)
+        return jsonify(sorted(({**m, "added": mine[m["id"]]} for m in metas if m), key=lambda m: m["added"], reverse=True))
 
     @app.get("/search")
     def search():
@@ -209,28 +241,35 @@ def create_app(token, allowed_origin, data_dir, executor=None):
             return jsonify(error="Esse link não é de um vídeo."), 422
         if (info.get("duration") or 0) > MAX_DURATION_S:
             return jsonify(error="Vídeo longo demais (máximo 3h)."), 422
-        existing = library.read(track_id)
-        if existing and existing["status"] != "error":
-            return jsonify(existing), 200
-        meta = {
-            "id": track_id,
-            "title": info.get("title") or track_id,
-            "channel": info.get("channel") or info.get("uploader") or "",
-            "duration": info.get("duration") or 0,
-            "status": "downloading",
-            "error": None,
-            "added": time.time(),
-        }
-        library.write(track_id, meta)
-        if info.get("url"):
-            streams[track_id] = {"url": info["url"], "headers": info.get("http_headers") or {}}
-        executor.submit(run_download, library, track_id, f"https://www.youtube.com/watch?v={track_id}")
-        return jsonify(meta), 202
+        with add_lock:
+            try:
+                accounts.add_track(g.user, track_id)
+            except LimitReached as exc:
+                return jsonify(error=str(exc)), 403
+            existing = library.read(track_id)
+            if existing and existing["status"] != "error":
+                return jsonify(with_added(existing)), 200  # já baixado (ou baixando) por alguém: só entra na lista
+            meta = {
+                "id": track_id,
+                "title": info.get("title") or track_id,
+                "channel": info.get("channel") or info.get("uploader") or "",
+                "duration": info.get("duration") or 0,
+                "status": "downloading",
+                "error": None,
+                "added": time.time(),
+            }
+            library.write(track_id, meta)
+            if info.get("url"):
+                streams[track_id] = {"url": info["url"], "headers": info.get("http_headers") or {}}
+            executor.submit(run_download, library, track_id, f"https://www.youtube.com/watch?v={track_id}")
+        return jsonify(with_added(meta)), 202
 
     @app.delete("/tracks/<track_id>")
     def delete_track(track_id):
         track_or_404(track_id)
-        library.delete(track_id)
+        if accounts.remove_track(g.user, track_id):  # era o último dono: some do disco
+            library.delete(track_id)
+            streams.pop(track_id, None)
         return "", 204
 
     @app.get("/tracks/<track_id>/audio")
@@ -264,4 +303,5 @@ def create_app_from_env():
         token=os.environ["MUSIC_TOKEN"],
         allowed_origin=os.environ["ALLOWED_ORIGIN"],
         data_dir=os.environ.get("DATA_DIR", "/data"),
+        admin_name=os.environ.get("ADMIN_NAME", "admin"),
     )
