@@ -1,0 +1,19 @@
+services:
+  yt-music-agent:
+    build: .
+    container_name: yt-music-agent
+    restart: unless-stopped
+    env_file: .env
+    # Só o próprio notebook alcança a porta (quem publica na tailnet é o `tailscale serve`).
+    # Não troque por "8091:8091": o Docker abriria a porta pra rede toda, ignorando o ufw.
+    ports:
+      - "127.0.0.1:8091:8091"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
