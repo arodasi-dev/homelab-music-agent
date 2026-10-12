@@ -6,6 +6,7 @@ Escuta só em `127.0.0.1:8091`; a tailnet chega nele via `tailscale serve`.
 ## API (tudo com `Authorization: Bearer $MUSIC_TOKEN`)
 | Rota | O que faz |
 |---|---|
+| `GET /search?q=...` | Busca no YouTube (10 resultados: id, título, canal, duração, miniatura) |
 | `GET /tracks` | Lista a biblioteca (`status`: `downloading`, `ready` ou `error`) |
 | `POST /tracks` `{"url": "..."}` | Adiciona um link e baixa em segundo plano |
 | `DELETE /tracks/<id>` | Apaga a faixa do disco |

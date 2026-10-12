@@ -125,6 +125,46 @@ def test_download_interrompido_vira_erro_ao_subir(tmp_path):
     assert agent.Library(tmp_path).read(VIDEO)["status"] == "error"
 
 
+def test_busca_devolve_resultados(client):
+    flat = {"entries": [
+        {"id": VIDEO, "title": "Achado", "channel": "Canal", "duration": 200},
+        {"id": "channel-id-longo-demais", "title": "Canal, não vídeo"},
+    ]}
+
+    class FakeYdl:
+        def __init__(self, options):
+            assert options["extract_flat"] is True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, query, download):
+            assert query == "ytsearch10:minha busca" and download is False
+            return flat
+
+    with patch.object(agent.yt_dlp, "YoutubeDL", FakeYdl):
+        res = client.get("/search?q=minha busca", headers=auth())
+    assert res.status_code == 200
+    assert res.get_json() == [{
+        "id": VIDEO, "title": "Achado", "channel": "Canal", "duration": 200,
+        "thumbnail": f"https://i.ytimg.com/vi/{VIDEO}/mqdefault.jpg",
+    }]
+
+
+def test_busca_exige_token_e_texto(client):
+    assert client.get("/search?q=x").status_code == 401
+    assert client.get("/search?q=%20", headers=auth()).status_code == 400
+    assert client.get(f"/search?q={'a' * 101}", headers=auth()).status_code == 400
+
+
+def test_busca_que_falha_devolve_502(client):
+    with patch.object(agent, "search_videos", side_effect=yt_dlp.utils.DownloadError("fora")):
+        assert client.get("/search?q=x", headers=auth()).status_code == 502
+
+
 def test_cors_so_pra_origem_permitida(client):
     ok = client.options("/tracks", headers={"Origin": ORIGIN})
     assert ok.status_code == 200

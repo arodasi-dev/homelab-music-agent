@@ -14,6 +14,8 @@ from flask import Flask, abort, jsonify, request, send_file
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 VIDEO_ID = re.compile(r"^[\w-]{11}$")
 MAX_DURATION_S = 3 * 3600
+SEARCH_LIMIT = 10
+MAX_QUERY_LENGTH = 100
 MAX_PARALLEL_DOWNLOADS = 2
 AUDIO_FILE = "audio.m4a"
 THUMB_FILE = "audio.jpg"
@@ -32,6 +34,23 @@ def ydl_options(**extra):
 def fetch_info(url):
     with yt_dlp.YoutubeDL(ydl_options()) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def search_videos(query):
+    """Primeiros resultados da busca do YouTube (só a lista, sem baixar nada)."""
+    with yt_dlp.YoutubeDL(ydl_options(extract_flat=True)) as ydl:
+        info = ydl.extract_info(f"ytsearch{SEARCH_LIMIT}:{query}", download=False)
+    return [
+        {
+            "id": entry["id"],
+            "title": entry.get("title") or entry["id"],
+            "channel": entry.get("channel") or entry.get("uploader") or "",
+            "duration": entry.get("duration") or 0,
+            "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
+        }
+        for entry in info.get("entries", [])
+        if VIDEO_ID.match(entry.get("id") or "")
+    ]
 
 
 def download_audio(url, dest):
@@ -137,6 +156,16 @@ def create_app(token, allowed_origin, data_dir, executor=None):
     @app.get("/tracks")
     def list_tracks():
         return jsonify(library.list())
+
+    @app.get("/search")
+    def search():
+        query = request.args.get("q", "").strip()
+        if not query or len(query) > MAX_QUERY_LENGTH:
+            return jsonify(error="Digite o que buscar."), 400
+        try:
+            return jsonify(search_videos(query))
+        except yt_dlp.utils.DownloadError:
+            return jsonify(error="A busca falhou. Tente de novo."), 502
 
     @app.post("/tracks")
     def add_track():
