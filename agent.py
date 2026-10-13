@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,8 @@ PASSTHROUGH_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accep
 AUDIO_FILE = "audio.m4a"
 THUMB_FILE = "audio.jpg"
 META_FILE = "meta.json"
+FASTSTART_MARKER = ".faststart"
+FASTSTART_TIMEOUT_S = 120
 
 
 def is_youtube_url(url):
@@ -94,6 +97,33 @@ def download_audio(url, dest):
     )
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
+    faststart(dest / AUDIO_FILE)
+
+
+def faststart(path):
+    """Move o índice do m4a pro começo do arquivo: sem isso o player precisa buscar o fim antes de tocar (demora)."""
+    tmp = path.with_name("faststart.m4a")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-c", "copy", "-movflags", "+faststart", str(tmp)],
+            check=True, timeout=FASTSTART_TIMEOUT_S,
+        )
+        tmp.replace(path)
+    except (OSError, subprocess.SubprocessError):  # o áudio continua tocando, só começa mais devagar
+        tmp.unlink(missing_ok=True)
+
+
+def faststart_existing(root):
+    """Conserta as faixas baixadas antes do `faststart` (roda uma vez no fundo ao subir o servidor)."""
+    for folder in root.iterdir():
+        path = folder / AUDIO_FILE
+        marker = folder / FASTSTART_MARKER
+        if path.is_file() and not marker.exists():
+            faststart(path)
+            try:
+                marker.touch()
+            except OSError:  # a faixa foi apagada no meio
+                pass
 
 
 class Library:
@@ -299,9 +329,12 @@ def create_app(token, allowed_origin, data_dir, executor=None, admin_name="admin
 
 
 def create_app_from_env():
-    return create_app(
+    data_dir = os.environ.get("DATA_DIR", "/data")
+    app = create_app(
         token=os.environ["MUSIC_TOKEN"],
         allowed_origin=os.environ["ALLOWED_ORIGIN"],
-        data_dir=os.environ.get("DATA_DIR", "/data"),
+        data_dir=data_dir,
         admin_name=os.environ.get("ADMIN_NAME", "admin"),
     )
+    threading.Thread(target=faststart_existing, args=(Path(data_dir) / "tracks",), daemon=True).start()
+    return app
